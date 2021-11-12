@@ -74,3 +74,82 @@ int Core::OS::AllocateVirtualPages(int chain, int page, int cnt) {
     }
   } while (true);
 }
+
+static DWORD input_console_mode;
+static DWORD output_console_mode;
+static char console_buffer[8];
+
+#ifndef ENABLE_PROCESSED_INPUT
+#define ENABLE_PROCESSED_INPUT 0x0001
+#endif
+
+#ifndef ENABLE_VIRTUAL_TERMINAL_INPUT
+#define ENABLE_VIRTUAL_TERMINAL_INPUT 0x0200
+#endif
+
+#ifndef ENABLE_PROCESSED_OUTPUT
+#define ENABLE_PROCESSED_OUTPUT 0x0001
+#endif
+
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
+
+#ifndef DISABLE_NEWLINE_AUTO_RETURN
+#define DISABLE_NEWLINE_AUTO_RETURN 0x0008
+#endif
+
+#ifndef KEY_EVENT
+#define KEY_EVENT 0x0001
+#endif
+
+static void StringCopy(char *dest, const char *src) {
+  while (*src != 0) {
+    *(dest++) = (*src++);
+  }
+  *dest = *src;
+}
+
+void Core::OS::ConsoleEnable() {
+  GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &input_console_mode);
+  GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &output_console_mode);
+
+  if (!SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), ENABLE_VIRTUAL_TERMINAL_INPUT)) {
+    printf("Error:Unable to set stdin mode\n");
+    exit(1);
+  }
+  if (!SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN)) {
+    printf("Error:Unable to set stdout mode\n");
+    exit(1);
+  }
+  console_buffer[0] = 0;
+}
+
+void Core::OS::ConsoleDisable() {
+  SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), input_console_mode);
+  SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), output_console_mode);
+}
+
+int Core::OS::ConsoleWidth() {
+  CONSOLE_SCREEN_BUFFER_INFO info;
+  GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info);
+  return info.srWindow.Right - info.srWindow.Left + 1;
+}
+
+int Core::OS::ConsoleHeight() {
+  CONSOLE_SCREEN_BUFFER_INFO info;
+  GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info);
+  return info.srWindow.Bottom - info.srWindow.Top + 1;
+}
+
+int Core::OS::ConsolePositionX() {
+  CONSOLE_SCREEN_BUFFER_INFO info;
+  GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info);
+  return info.dwCursorPosition.X - info.srWindow.Left + 1;
+}
+
+int Core::OS::ConsolePositionY() {
+  CONSOLE_SCREEN_BUFFER_INFO info;
+  GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info);
+  return info.dwCursorPosition.Y - info.srWindow.Top + 1;
+}

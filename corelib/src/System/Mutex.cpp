@@ -11,15 +11,15 @@ Core::Sync::~Sync() {
 }
 
 void System::Mutex::Create() {
-  StdMutex = (void*)new std::mutex();
-  StdCondition = (void*)new std::condition_variable_any();
+  NativeMutex = (void*)new std::mutex();
+  NativeCondition = (void*)new std::condition_variable_any();
   Owner = nullptr;
   Count = 0;
 }
 
 void System::Mutex::Destroy() {
-  std::mutex* mutex = (std::mutex*)StdMutex;
-  std::condition_variable_any* condition = (std::condition_variable_any*)StdCondition;
+  std::mutex* mutex = (std::mutex*)NativeMutex;
+  std::condition_variable_any* condition = (std::condition_variable_any*)NativeCondition;
   if (Count > 0) {
     System::Console::WriteLine(Core::utf16ToString(u"Error:~Mutex while mutex is still locked"));
   }
@@ -28,7 +28,7 @@ void System::Mutex::Destroy() {
 }
 
 void System::Mutex::Lock() {
-  std::mutex* mutex = (std::mutex*)StdMutex;
+  std::mutex* mutex = (std::mutex*)NativeMutex;
   if (Owner == System::Thread::Current()) {
     Count++;
   } else {
@@ -39,7 +39,7 @@ void System::Mutex::Lock() {
 }
 
 void System::Mutex::Unlock() {
-  std::mutex* mutex = (std::mutex*)StdMutex;
+  std::mutex* mutex = (std::mutex*)NativeMutex;
   if (Count == 0) {
     System::Console::WriteLine(Core::utf16ToString(u"Error:Mutex unlock() but not locked"));
     return;
@@ -52,8 +52,8 @@ void System::Mutex::Unlock() {
 }
 
 void System::Mutex::Wait() {
-  std::mutex* mutex = (std::mutex*)StdMutex;
-  std::condition_variable_any* condition = (std::condition_variable_any*)StdCondition;
+  std::mutex* mutex = (std::mutex*)NativeMutex;
+  std::condition_variable_any* condition = (std::condition_variable_any*)NativeCondition;
   int wcount = Count;
   System::Thread* wthread = Owner;
   Count = 0;
@@ -64,11 +64,11 @@ void System::Mutex::Wait() {
 }
 
 void System::Mutex::NotifyOne() {
-  std::condition_variable_any* condition = (std::condition_variable_any*)StdCondition;
+  std::condition_variable_any* condition = (std::condition_variable_any*)NativeCondition;
   condition->notify_one();
 }
 
 void System::Mutex::NotifyAll() {
-  std::condition_variable_any* condition = (std::condition_variable_any*)StdCondition;
+  std::condition_variable_any* condition = (std::condition_variable_any*)NativeCondition;
   condition->notify_all();
 }

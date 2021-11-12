@@ -51,6 +51,7 @@ namespace System {
       int length = 0;
       for(int a=0;a<utf8.Length;a++) {
         byte ch = utf8[a];
+        if (ch == 0) break;
         if (ch > 127) {
           length++;
           if ((ch & 0b11110000) == 0b11110000) {
@@ -74,6 +75,7 @@ namespace System {
       Value = new char[length];
       for(int a=0;a<length;a++) {
         int ch = utf8[pos++];
+        if (ch == 0) break;
         int bits;
         int bits32;
         if (ch > 127) {
@@ -122,6 +124,7 @@ namespace System {
       for(int a=0;a<length;a++) {
         if (Value[a] > 127) bytes += 2;
       }
+      bytes++;  //null terminate string
       byte[] copy = new byte[bytes];
       //convert codes
       int pos = 0;

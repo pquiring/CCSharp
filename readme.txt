@@ -18,6 +18,14 @@ I've tried MANY times to use Java's compiler to build a similar project but it j
 and converting Java to C++ or C is impossible (even tried x64 assembly).  The Java language is just too abstract to implement.
 Just look at the problems Oracle is having with Graal.
 
+Object Ownership
+================
+
+  Object.clone()
+  Object.retain() (not possible with pure pointers - need references like the R_ project)
+  Object.release()
+  Object.pass()
+
 Supported C# features
 ---------------------
 

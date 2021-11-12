@@ -18,6 +18,7 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Diagnostics;
+using Microsoft.CodeAnalysis.Emit;
 
 namespace CCSharpCompiler
 {
@@ -230,12 +231,22 @@ namespace CCSharpCompiler
     void Process()
     {
       compiler = CSharpCompilation.Create("C#");
+      if (true) {
+        //allow unsafe operations
+        CSharpCompilationOptions options = compiler.Options.WithAllowUnsafe(true);
+        compiler = compiler.WithOptions(options);
+      }
+      if (library) {
+        CSharpCompilationOptions options = compiler.Options.WithOutputKind(OutputKind.DynamicallyLinkedLibrary);
+        compiler = compiler.WithOptions(options);
+      }
       foreach(var lib in refs) {
         Console.WriteLine("Adding Reference:" + lib);
         compiler = compiler.AddReferences(MetadataReference.CreateFromFile(lib));
       }
       //TODO : use DiagnosticSuppressor to suppress CS0626(extern without DllImport) and CS0227(unsafe usage) (not working yet - need help!)
-      compiler = (CSharpCompilation)compiler.WithAnalyzers(ImmutableArray.Create(new DiagnosticAnalyzer[] {new DiagnosticSuppressorCS0626(), new DiagnosticSuppressorCS0227()})).Compilation;
+      //this doesn't work! Ignore them when printing diagnostics
+      //compiler = (CSharpCompilation)compiler.WithAnalyzers(ImmutableArray.Create(new DiagnosticAnalyzer[] {new DiagnosticSuppressorCS0626(), new DiagnosticSuppressorCS0227()})).Compilation;
       AddFolder(csFolder);
       foreach(Source node in files)
       {
@@ -243,6 +254,21 @@ namespace CCSharpCompiler
         if (printTree) {
           PrintNodes(node, node.tree.GetRoot().ChildNodes(), 0, true);
         }
+      }
+      //generate assembly
+      EmitResult results = compiler.Emit(File.Create(target + ".dll"));
+      foreach(Diagnostic diag in results.Diagnostics) {
+        switch (diag.Id) {
+          case "CS0626": continue;  //extern without DllImport
+        }
+        if (diag.Location.SourceTree != null) {
+          Console.WriteLine(FindTree(diag.Location.SourceTree));
+        }
+        Console.WriteLine(diag.ToString());
+      }
+      if (!results.Success) {
+        Console.WriteLine("Compiler Errors Detected!");
+        Environment.Exit(1);
       }
       try {
         new Generate().GenerateSources();
@@ -283,6 +309,15 @@ namespace CCSharpCompiler
       node.tree = CSharpSyntaxTree.ParseText(node.src);
       compiler = compiler.AddSyntaxTrees(node.tree);
       files.Add(node);
+    }
+
+    string FindTree(SyntaxTree tree) {
+      foreach(var node in files) {
+        if (node.tree == tree) {
+          return node.csFile;
+        }
+      }
+      return "?";
     }
 
     void PrintNodes(Source file, IEnumerable<SyntaxNode> nodes, int lvl, bool showDiag)

@@ -7,6 +7,7 @@ using System;
 namespace System.IO {
   public class File {
     public File(String filename) {
+      Name = filename;
       Create(filename);
     }
     private unsafe File(void* value) {
@@ -23,6 +24,7 @@ namespace System.IO {
     public extern bool MakeFolders();
     public extern bool DeleteFolder();
 
+    private String Name;
     private unsafe void* Value;
     private extern void Create(String filename);
     private extern void Destroy();

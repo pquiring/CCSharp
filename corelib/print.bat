@@ -1,4 +1,4 @@
 @echo off
-..\bin\QCSharpCompiler src System --library --home=.. --print > print.txt
+..\bin\CCSharpCompiler src System --library --home=.. --print > print.txt
 echo print.txt generated!
 

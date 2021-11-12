@@ -12,8 +12,8 @@ namespace System {
     public extern void NotifyOne();
     public extern void NotifyAll();
 
-    private unsafe void* StdMutex;
-    private unsafe void* StdCondition;
+    private unsafe void* NativeMutex;
+    private unsafe void* NativeCondition;
     private int Count;
     private Thread Owner;
     private extern void Create();
