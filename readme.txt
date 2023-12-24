@@ -53,8 +53,12 @@ Linux
     The version in the default repo is probably too old.
     Note: The generated .exe / .dll files are no different than the ones generated in Windows.
 
-Builing
-=======
+Requirements
+============
+  .NET 8.0 - this means Mono may no longer be a valid option.
+
+Building
+========
   Most building is done with scripts (scripts are for noobs) and ninja.  Will improve later.
 
 Author : Peter Quiring (pquiring at gmail dot com)

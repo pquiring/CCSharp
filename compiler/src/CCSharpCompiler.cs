@@ -20,8 +20,8 @@ using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Diagnostics;
 using Microsoft.CodeAnalysis.Emit;
 
-namespace CCSharpCompiler
-{
+namespace CCSharpCompiler;
+
   class Program
   {
     public static string csFolder;
@@ -3965,4 +3965,4 @@ namespace CCSharpCompiler
       }
     }
   }
-}
+  
