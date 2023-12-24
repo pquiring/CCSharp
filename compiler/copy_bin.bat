@@ -1,2 +1,5 @@
 @echo off
-copy src\bin\release\net6.0\win10-x64\publish\CCSharpCompiler.exe ..\bin
+
+copy src\bin\x64\release\net8.0\win-x64\*.exe ..\..\bin
+copy src\bin\x64\release\net8.0\win-x64\*.dll ..\..\bin
+copy src\bin\x64\release\net8.0\win-x64\*.json ..\..\bin
