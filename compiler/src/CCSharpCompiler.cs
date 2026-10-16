@@ -13,6 +13,7 @@ using System.IO;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Text;
+using System.Linq;
 
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
@@ -51,6 +52,14 @@ namespace CCSharpCompiler;
     public static bool debug = false;
     public static bool no_npe_checks = false;
     public static bool no_abe_checks = false;
+    public static bool crust = true;           //the Crust back end is the default; --gc selects the legacy GC back end
+    public static string dnaCorlib;            //--dna-corlib=FILE : DotNetAnywhere's corlib.dll, which the managed classes are compiled against
+    public static string describePath;         //--describe=FILE : write the program's classes and their public fields (JSON) and stop; see Describe()
+    public static bool dna;                    //--dna : classes Crust refuses (and [Managed] ones) stay C# and run on DotNetAnywhere; see Partition.cs
+    public static string srcListPath;          //--srclist=FILE : the C# files of the program, one per line (a whole project, or several folders)
+    public static string corelibPath;          //--corelib=DIR : the C# corelib sources (default: found from --home / the compiler)
+    public static string coostPath;            //--coost=DIR   : informational, build.py passes it to the C++ side
+    public static string crustPath;            //--crust=DIR   : informational, build.py passes it to the C++ side
     public static List<string> refs = new List<string>();
     public static List<string> libs = new List<string>();
 
@@ -58,6 +67,19 @@ namespace CCSharpCompiler;
 
     static void Main(string[] args)
     {
+      // ccs --managed-compile OUT.dll CORLIB.dll FILE.cs ... : just the managed side (Roslyn against DotNetAnywhere's corlib), no C++.
+      // For a host that has its own native side (crust's unity_pack --hybrid); exit status 0 when it compiled, errors on stderr.
+      // An OUT ending in .exe is a console program (its one static Main), anything else a library.
+      if (args.Length >= 4 && args[0] == "--managed-compile") {
+        var merrs = ManagedBuild.Compile(args.Skip(3), args[2], args[1], args[1].EndsWith(".exe"), null);
+        foreach (var e in merrs) Console.Error.WriteLine(e);
+        Environment.Exit(merrs.Count == 0 ? 0 : 1);
+      }
+      // ccs --lower-cpp P.main.cpp : the direct C back end (step 1): the program part of the C++ subset, lowered to C without cpprust.
+      // Exit status 3: a construct it does not handle yet (the reason on stderr).
+      if (args.Length >= 2 && args[0] == "--lower-cpp") {
+        Environment.Exit(CppLowerer.Run(args[1], args.Length > 2 && args[2].StartsWith("--foreign=") ? args[2].Substring(10) : null));
+      }
       if (args.Length < 2) {
         Console.WriteLine("CC# Compiler/" + version);
         Console.WriteLine("Usage : CCSharpCompiler cs_folder project_name [options]");
@@ -86,6 +108,13 @@ namespace CCSharpCompiler;
         Console.WriteLine("    disable ABE checks");
         Console.WriteLine("  --console");
         Console.WriteLine("    create console app");
+        Console.WriteLine("  --crust");
+        Console.WriteLine("    emit the C++ subset accepted by Crust (cpprust).  This is the default.");
+        Console.WriteLine("  --srclist=file");
+        Console.WriteLine("    the program's C# files, one path per line, instead of every .cs under cs_folder.");
+        Console.WriteLine("    (build.py expands folders, .csproj and .sln files into this list)");
+        Console.WriteLine("  --corelib=dir");
+        Console.WriteLine("    the C# corelib sources (default: corelib/src found from --home or from the compiler)");
         return;
       }
 
@@ -129,6 +158,32 @@ namespace CCSharpCompiler;
         }
         if (arg == "--console") {
           console = true;
+        }
+        if (arg == "--crust") {
+          crust = true;
+          if (value.Length > 0) crustPath = value;
+        }
+        if (arg == "--dna") {
+          dna = true;
+        }
+        if (arg == "--describe" && value.Length > 0) {
+          describePath = value;
+        }
+        if (arg == "--dna-corlib" && value.Length > 0) {
+          dnaCorlib = value;
+        }
+        if (arg == "--gc") {
+          Console.WriteLine("Error: the GC back end was removed with its corelib (see the git history before the Crust corelib).  CC# now emits Crust C++ only.");
+          Environment.Exit(1);
+        }
+        if (arg == "--srclist" && value.Length > 0) {
+          srcListPath = value;
+        }
+        if (arg == "--corelib" && value.Length > 0) {
+          corelibPath = value.Replace("\\", "/");
+        }
+        if (arg == "--coost" && value.Length > 0) {
+          coostPath = value.Replace("\\", "/");
         }
         if (arg == "--no-npe-checks") {
           no_npe_checks = true;
@@ -193,7 +248,7 @@ namespace CCSharpCompiler;
         Console.WriteLine("Error:--service requires --main");
         return;
       }
-      if (!library && main == null) {
+      if (!library && main == null && !crust) {
         Console.WriteLine("Error:application requires --main");
         return;
       }
@@ -213,6 +268,10 @@ namespace CCSharpCompiler;
         ext_lib = ".a";
         ext_exe = "";
         path_sep = "/";
+      }
+      if (crust) {
+        new Program().ProcessCrust();
+        return;
       }
       if (windows) {
         BuildNinjaWindows();
@@ -277,6 +336,378 @@ namespace CCSharpCompiler;
       }
     }
 
+    /** --crust : Roslyn analyses the C#, CrustEmitter writes the Crust C++ subset. */
+    void ProcessCrust()
+    {
+      compiler = CSharpCompilation.Create("C#");
+      compiler = compiler.WithOptions(compiler.Options.WithOutputKind(OutputKind.DynamicallyLinkedLibrary).WithAllowUnsafe(true));
+      //(a library: nothing is emitted, and the entry point is chosen by CC# -- see --main -- not by Roslyn's CS0017)
+      //The corelib is C# source compiled as part of the program, INSTEAD of the .NET reference assemblies:
+      //it declares System.Object and the rest, so it is also the whole of what a program can name.
+      string corelibDir = FindCorelib();
+      libTrees.Clear();
+      foreach (var f in Directory.GetFiles(corelibDir, "*.cs", SearchOption.AllDirectories).OrderBy(x => x, StringComparer.Ordinal)) {
+        var t = CSharpSyntaxTree.ParseText(File.ReadAllText(f), path: f);
+        libTrees.Add(t);
+        compiler = compiler.AddSyntaxTrees(t);
+      }
+      path_sep = "/";
+      ext_obj = ".o";
+      AddProgramFiles();
+      bool failed = false;
+      foreach (var diag in compiler.GetDiagnostics()) {
+        if (diag.Severity != DiagnosticSeverity.Error) continue;
+        if (diag.Id == "CS0626") continue;
+        if (diag.Location.SourceTree != null) {
+          if (libTrees.Contains(diag.Location.SourceTree)) Console.Write("corelib " + diag.Location.SourceTree.FilePath + ": ");
+          else Console.Write(FindTree(diag.Location.SourceTree) + ": ");
+        }
+        Console.WriteLine(diag.ToString());
+        failed = true;
+      }
+      if (failed) {
+        Console.WriteLine("Compiler Errors Detected!");
+        Environment.Exit(1);
+      }
+      foreach (Source node in files) node.model = compiler.GetSemanticModel(node.tree);
+      files = CrustOrder(files);
+      if (describePath != null) { Describe(); return; }
+      Directory.CreateDirectory(cppFolder);
+      //--dna: decide which classes are native and which managed before anything is written
+      PartitionPlan plan = null;
+      BridgePlan bridge = null;
+      var tuples = files.Select(f => (f.tree, f.model, f.csFile)).ToList();
+      if (dna) {
+        plan = PartitionPlan.Declare(tuples);
+        var probe = new CrustEmitter(main) { plan = plan, probing = true };
+        foreach (Source node in files) probe.EmitFile(node);
+        CrustEmitter.entryCall = null; CrustEmitter.entryReturnsInt = false; CrustEmitter.entryTakesArgs = false;   //(the probe is not the program)
+        CrustEmitter.entryCandidates.Clear();
+        plan.Build(tuples, main == null ? null : main.Replace("::", "."));
+        if (plan.Errors.Count == 0) {   //(a conflict already named is the cause of the references that follow from it)
+          bridge = BridgePlan.Build(plan);
+          //a native class that uses a managed class in a way that cannot cross follows it to the managed side (never the other way: the class
+          //it uses is not pulled across).  That changes what crosses, so decide again, until nothing more moves.
+          for (int round = 0; round < 50 && bridge.Demotable.Count > 0; round++) {
+            foreach (var kv in bridge.Demotable) kv.Key.Demoted = kv.Value;
+            plan.Rebuild(tuples, main == null ? null : main.Replace("::", "."));
+            if (plan.Errors.Count > 0) break;
+            bridge = BridgePlan.Build(plan);
+          }
+          plan.Errors.AddRange(bridge.Errors);
+          plan.Bridge = bridge;
+        }
+        if (plan.Errors.Count > 0) {
+          foreach (var err in plan.Errors) Console.WriteLine(err);
+          Console.WriteLine("CCSharp --dna: " + plan.Errors.Count + " problem(s) with the native/managed partition");
+          Environment.Exit(1);
+        }
+      }
+      var em = new CrustEmitter(main) { plan = plan };
+      var includes = new StringBuilder();
+      var allPieces = new List<CrustEmitter.CppPiece>();
+      foreach (Source node in files) {
+        var pieces = em.EmitFile(node);
+        if (pieces == null) continue;
+        allPieces.AddRange(pieces);
+        //the whole file, to read (and for tools that check lines): the program is built from the pieces below, not from this
+        File.WriteAllText(cppFolder + "/" + Path.GetFileName(node.cppFile), FileView(pieces));
+      }
+      foreach (var piece in OrderPieces(allPieces)) {
+        File.WriteAllText(cppFolder + "/" + piece.Name + ".cpp", piece.Text);
+        includes.Append("#include \"" + piece.Name + ".cpp\"\n");
+      }
+      if (em.errors.Count > 0) {
+        foreach (var err in em.errors) Console.WriteLine(err);
+        Console.WriteLine("CCSharp --crust: " + em.errors.Count + " construct(s) outside the Crust C# subset");
+        Environment.Exit(1);
+      }
+      bool managedEntry = plan != null && (plan.ManagedEntry != null || plan.GlobalStatementFiles.Count > 0);
+      if (CrustEmitter.entryCall == null && !library && !managedEntry) {
+        Console.WriteLine("Error: no `static int Main()` / `static void Main()` / `Main(string[] args)` found" + (main != null ? " in " + main : ""));
+        Environment.Exit(1);
+      }
+      var inc = new StringBuilder("#include <stdio.h>\n");
+      if (em.UsesStrcmp) inc.Append("#include <string.h>\n");
+      if (bridge != null && bridge.UsesString) em.UsesString = true;
+      if (bridge != null) foreach (var h in bridge.Includes) em.Includes.Add(h);       //(what a foreign function in an export needs)
+      if (em.UsesString) em.Includes.Add("\"cs/core.h\"");                    //fastring, whichever way the string came about
+      foreach (var h in em.Includes) inc.Append("#include " + h + "\n");      //what the corelib members used need
+      var allEntries = CrustEmitter.entryCandidates.Select(c => c.Replace("::Main", ".Main").Replace("_", ".")).ToList();
+      if (plan != null) allEntries.AddRange(plan.ManagedEntries.Select(c => c + ".Main"));
+      if (!library && main == null && allEntries.Count > 1) {
+        Console.WriteLine("Error: " + allEntries.Count + " entry points: "
+          + string.Join(", ", allEntries) + "\n  Say which one with --main=Class.");
+        Environment.Exit(1);
+      }
+      string aggregate = inc.ToString() + (bridge != null ? bridge.CppProxies() : "") + em.Preamble + "\n" + includes.ToString() + (bridge != null ? bridge.CppExports() : "")
+        + (library ? "" : em.EmitMain());
+      File.WriteAllText(cppFolder + "/" + target + ".main.cpp", aggregate);   //".main.cpp": a file's own output never has a dot in its stem, so this cannot collide
+      if (plan != null) {
+        File.WriteAllText(cppFolder + "/" + target + ".partition.json", plan.ToJson());
+        var managed = plan.WriteManagedSources(tuples, cppFolder + "/managed");
+        if (bridge.NeedsManagedExtras) {
+          File.WriteAllText(cppFolder + "/managed/_Bridge.cs", bridge.CsProxies());
+          managed.Add(cppFolder + "/managed/_Bridge.cs");
+        }
+        if (bridge.ToNative.Any()) File.WriteAllText(cppFolder + "/" + target + ".ffi.json", bridge.FfiManifest());
+        if (bridge.Methods.Count > 0 || managedEntry)
+          File.WriteAllText(cppFolder + "/" + target + ".bridge.c", bridge.GlueC(target, CrustEmitter.entryCall == null && managedEntry));
+        if (dnaCorlib != null && managed.Count > 0) {
+          bool exe = plan.ManagedEntry != null && CrustEmitter.entryCall == null;
+          var merr = ManagedBuild.Compile(managed, dnaCorlib, cppFolder + "/" + target + ".managed.dll", exe, plan.ManagedEntry);
+          if (merr.Count > 0) {
+            foreach (var e in merr) Console.WriteLine(e);
+            Console.WriteLine("CCSharp --dna: the managed classes did not compile against " + dnaCorlib);
+            Environment.Exit(1);
+          }
+          Console.WriteLine("CCSharp --dna: built " + cppFolder + "/" + target + ".managed.dll");
+        }
+        Console.WriteLine("CCSharp --dna: " + plan.NativeClasses.Count() + " native class(es), " + plan.ManagedClasses.Count() + " managed ("
+          + managed.Count + " file(s) in " + cppFolder + "/managed)");
+        foreach (var mc in plan.ManagedClasses) Console.WriteLine("  managed " + mc.Name + ": " + mc.Reason);
+      }
+      Console.WriteLine("CCSharp --crust generated " + cppFolder + "/" + target + ".main.cpp");
+    }
+
+    public static List<SyntaxTree> libTrees = new List<SyntaxTree>();
+
+    /** The program's files: --srclist, or a single .cs file, or every .cs under the folder.  Files are named relative to
+        their common folder, so two Util.cs in different folders stay two files, and diagnostics keep the original paths. */
+    void AddProgramFiles()
+    {
+      List<string> list = null;
+      if (srcListPath != null) {
+        list = File.ReadAllLines(srcListPath).Select(l => l.Trim()).Where(l => l.Length > 0 && !l.StartsWith("#")).ToList();
+      } else if (File.Exists(csFolder)) {
+        list = new List<string> { csFolder };
+      }
+      if (list == null) {
+        csFolder = Path.GetFullPath(csFolder).TrimEnd('/', '\\');
+        AddFolderSorted(csFolder);
+        return;
+      }
+      var full = list.Select(f => Path.GetFullPath(f).Replace("\\", "/")).Distinct().OrderBy(x => x, StringComparer.Ordinal).ToList();
+      foreach (var f in full) {
+        if (!File.Exists(f)) { Console.WriteLine("Error: source file not found: " + f); Environment.Exit(1); }
+      }
+      if (full.Count == 0) { Console.WriteLine("Error: no C# files in the program."); Environment.Exit(1); }
+      //the common folder
+      string root = Path.GetDirectoryName(full[0]).Replace("\\", "/");
+      foreach (var f in full) {
+        while (!(f + "/").StartsWith(root.TrimEnd('/') + "/")) root = Path.GetDirectoryName(root).Replace("\\", "/");
+      }
+      csFolder = root.TrimEnd('/');
+      foreach (var f in full) AddFile(f);
+    }
+
+    /** corelib/src: --corelib=DIR, else $home/corelib/src, else found by walking up from the compiler's own folder. */
+    string FindCorelib()
+    {
+      var tried = new List<string>();
+      var cands = new List<string>();
+      if (corelibPath != null) cands.Add(corelibPath);
+      cands.Add(Path.Combine(home, "corelib", "src"));
+      string d = AppContext.BaseDirectory;
+      for (int i = 0; i < 6 && d != null; i++) {
+        cands.Add(Path.Combine(d, "corelib", "src"));
+        d = Path.GetDirectoryName(d.TrimEnd('/', '\\'));
+      }
+      foreach (var c in cands) {
+        tried.Add(c);
+        if (Directory.Exists(c) && File.Exists(Path.Combine(c, "System", "Core.cs"))) return Path.GetFullPath(c);
+      }
+      Console.WriteLine("Error: the corelib was not found.  Looked in:\n  " + string.Join("\n  ", tried) + "\nPass --corelib=DIR or --home=DIR (the CCSharp checkout).");
+      Environment.Exit(1);
+      return null;
+    }
+
+    /** a file whose types use another file's types comes after it. */
+    /** A file's pieces as one text, each at its own source line (`#line` where one starts): for reading, and for tools that check where a line went. */
+    static string FileView(List<CrustEmitter.CppPiece> pieces)
+    {
+      var sb = new StringBuilder();
+      foreach (var p in pieces.Where(x => !x.IsHelper)) {
+        string t = p.Text.TrimStart('\n');
+        int lead = p.Text.Length - t.Length;
+        if (lead > 0 || sb.Length > 0) sb.Append("#line ").Append(lead + 1).Append('\n');      //(a piece at the top of the file needs none)
+        sb.Append(t).Append('\n');
+      }
+      return sb.ToString();
+    }
+
+    /** The program's types in the order they are included.  The base order is the one that has always worked (files after the files they use, a type after
+        its bases).  It is kept, except where C needs a type declared before something that cpprust's own ordering does not see:
+          * a STATIC variable (a pool: `static Ball[] pool`) is a variable at file scope; it comes after the arena class whose pointers or container it holds,
+            and a class that uses another class's static variable comes after that class;
+          * a class that dereferences an arena class (calls its methods, reads its fields) comes after it, because a reference to one is a pointer, which
+            cpprust does not count as a dependency;
+          * a value class embedded in another by value comes before it.
+        Types that need each other (a cycle: two arena classes that use each other's fields) keep their base order among themselves; the rest is a
+        topological order, so it cannot oscillate. */
+    /** --describe=FILE: every class of the program (not the corelib) with its base and its public instance fields, typed by Roslyn.  A tool that
+        writes a scene as code (unity_pack) asks this instead of reading the scripts itself: the type of `speed` is the compiler's to say. */
+    void Describe()
+    {
+      var sb = new StringBuilder("{\n");
+      bool firstClass = true;
+      foreach (Source node in files) {
+        foreach (var cd in node.tree.GetRoot().DescendantNodes().OfType<ClassDeclarationSyntax>()) {
+          var sym = node.model.GetDeclaredSymbol(cd) as INamedTypeSymbol;
+          if (sym == null) continue;
+          if (!firstClass) sb.Append(",\n");
+          firstClass = false;
+          sb.Append("  \"" + sym.Name + "\": {\"base\": " + (sym.BaseType != null && sym.BaseType.SpecialType == SpecialType.None ? "\"" + sym.BaseType.Name + "\"" : "null") + ", \"fields\": {");
+          bool firstField = true;
+          foreach (var f in sym.GetMembers().OfType<IFieldSymbol>()) {
+            if (f.IsStatic || f.IsConst || f.DeclaredAccessibility != Accessibility.Public || f.IsImplicitlyDeclared) continue;
+            if (!firstField) sb.Append(", ");
+            firstField = false;
+            sb.Append("\"" + f.Name + "\": \"" + f.Type.ToDisplayString() + "\"");
+          }
+          sb.Append("}}");
+        }
+      }
+      sb.Append("\n}\n");
+      File.WriteAllText(describePath, sb.ToString());
+    }
+
+    static List<CrustEmitter.CppPiece> OrderPieces(List<CrustEmitter.CppPiece> pieces)
+    {
+      var byType = new Dictionary<ISymbol, CrustEmitter.CppPiece>(SymbolEqualityComparer.Default);
+      foreach (var p in pieces) if (p.Sym != null) byType[p.Sym.OriginalDefinition] = p;
+      CrustEmitter.CppPiece PieceOf(ITypeSymbol t)
+      {
+        while (t is IArrayTypeSymbol at) t = at.ElementType;
+        if (t is INamedTypeSymbol nt) { var o = nt; while (o.ContainingType != null) o = o.ContainingType; if (byType.TryGetValue(o.OriginalDefinition, out var pc)) return pc; }
+        return null;
+      }
+      IEnumerable<CrustEmitter.CppPiece> Named(ITypeSymbol t)
+      {
+        var pc = PieceOf(t);
+        if (pc != null) yield return pc;
+        if (t is INamedTypeSymbol nt) foreach (var a in nt.TypeArguments) foreach (var x in Named(a)) yield return x;
+        if (t is IArrayTypeSymbol at) foreach (var x in Named(at.ElementType)) yield return x;
+      }
+      bool IsArenaPiece(CrustEmitter.CppPiece p) { return p.Sym != null && ArenaClass.Is(p.Sym); }
+      bool IsStaticVar(ISymbol sym)
+      {
+        if (!sym.IsStatic) return false;
+        if (sym is IFieldSymbol f) return !f.IsConst && f.ContainingType.TypeKind != TypeKind.Enum;
+        if (sym is IPropertySymbol pr) return pr.GetMethod != null && pr.GetMethod.DeclaringSyntaxReferences.Any(r => r.GetSyntax() is AccessorDeclarationSyntax ad && ad.Body == null && ad.ExpressionBody == null);
+        return false;
+      }
+      // what each piece needs to come first
+      var needs = new Dictionary<CrustEmitter.CppPiece, List<CrustEmitter.CppPiece>>();
+      foreach (var p in pieces) {
+        var set = new List<CrustEmitter.CppPiece>();
+        void Add(CrustEmitter.CppPiece x) { if (x != null && x != p && !set.Contains(x)) set.Add(x); }
+        foreach (var h in p.Helpers) Add(h);                                                       // a helper it calls
+        foreach (var ty in p.NeedTypes) foreach (var x in Named(ty)) Add(x);                      // (a helper) the types it is written for
+        if (p.Decl == null) { needs[p] = set; continue; }
+        if (p.Sym is INamedTypeSymbol self && self.BaseType != null) foreach (var x in Named(self.BaseType)) Add(x);   // a base class is laid out first
+        foreach (var n in p.Decl.DescendantNodes().OfType<SimpleNameSyntax>()) {
+          var sym = p.Model.GetSymbolInfo(n).Symbol;
+          if (sym == null) continue;
+          var owner = sym.ContainingType != null ? PieceOf(sym.ContainingType) : null;
+          if (owner != null && IsStaticVar(sym)) Add(owner);                                     // a static variable it uses
+          if (owner != null && IsArenaPiece(owner) && !sym.IsStatic && !(sym is INamedTypeSymbol)) Add(owner);   // an arena object's member it dereferences
+        }
+        foreach (var m in p.Decl.DescendantNodes().OfType<MemberDeclarationSyntax>().Where(m => m is FieldDeclarationSyntax || m is PropertyDeclarationSyntax)) {
+          var syms = m is FieldDeclarationSyntax fd ? fd.Declaration.Variables.Select(v => p.Model.GetDeclaredSymbol(v)) : new[] { p.Model.GetDeclaredSymbol(m) };
+          foreach (var sy in syms) {
+            ITypeSymbol ty = sy is IFieldSymbol f ? f.Type : sy is IPropertySymbol pr ? pr.Type : null;
+            if (ty == null) continue;
+            foreach (var x in Named(ty)) {
+              if (!IsArenaPiece(x)) Add(x);                                                      // a value class it embeds
+              else if (sy.IsStatic) Add(x);                                                      // the arena class whose pointers a static pool holds
+            }
+          }
+        }
+        needs[p] = set;
+      }
+      // Strongly connected components (Tarjan): a group of types that need each other has no order that satisfies them all, so it keeps the base order,
+      // which is the one cpprust is known to handle; the groups themselves are ordered so that what a group needs comes before it.  Tarjan emits a
+      // component after every component it needs, and visits in the base order, so what nothing constrains stays where it was.
+      var baseIndex = new Dictionary<CrustEmitter.CppPiece, int>();
+      for (int i = 0; i < pieces.Count; i++) baseIndex[pieces[i]] = i;
+      var order = new List<CrustEmitter.CppPiece>();
+      var index = new Dictionary<CrustEmitter.CppPiece, int>();
+      var low = new Dictionary<CrustEmitter.CppPiece, int>();
+      var onStack = new HashSet<CrustEmitter.CppPiece>();
+      var stack = new Stack<CrustEmitter.CppPiece>();
+      int counter = 0;
+      void Connect(CrustEmitter.CppPiece v)
+      {
+        index[v] = low[v] = counter++;
+        stack.Push(v);
+        onStack.Add(v);
+        foreach (var w in needs[v].OrderBy(x => baseIndex[x])) {
+          if (!index.ContainsKey(w)) { Connect(w); low[v] = Math.Min(low[v], low[w]); }
+          else if (onStack.Contains(w)) low[v] = Math.Min(low[v], index[w]);
+        }
+        if (low[v] == index[v]) {
+          var comp = new List<CrustEmitter.CppPiece>();
+          CrustEmitter.CppPiece w;
+          do { w = stack.Pop(); onStack.Remove(w); comp.Add(w); } while (w != v);
+          order.AddRange(comp.OrderBy(x => baseIndex[x]));
+        }
+      }
+      foreach (var p in pieces) if (!index.ContainsKey(p)) Connect(p);
+      if (Environment.GetEnvironmentVariable("CCS_DEBUG_ORDER") == "1")
+        File.WriteAllText("/tmp/ccs_order.log", string.Join("\n", order.Select((p, i) => i + " " + p.Name + (order.IndexOf(p) != pieces.IndexOf(p) ? "   (was " + pieces.IndexOf(p) + ")" : ""))) + "\n");
+      return order;
+    }
+
+    /** The program is parsed with CRUST defined, as csrust and cs2cpp do: a library keeps what the subset cannot take (a debug ToString, a LINQ
+        dump) behind `#if !CRUST`.  The managed half of a --dna build is parsed without it: that code runs on a full runtime. */
+    static readonly CSharpParseOptions CrustParse = CSharpParseOptions.Default.WithPreprocessorSymbols("CRUST");
+
+    List<Source> CrustOrder(List<Source> list)
+    {
+      var declaredIn = new Dictionary<ISymbol, Source>(SymbolEqualityComparer.Default);
+      foreach (var f in list) {
+        foreach (var d in f.tree.GetRoot().DescendantNodes().OfType<BaseTypeDeclarationSyntax>()) {
+          var s = f.model.GetDeclaredSymbol(d);
+          if (s != null) declaredIn[s] = f;
+        }
+      }
+      var deps = new Dictionary<Source, HashSet<Source>>();
+      foreach (var f in list) {
+        var set = new HashSet<Source>();
+        foreach (var n in f.tree.GetRoot().DescendantNodes().OfType<IdentifierNameSyntax>()) {
+          var sym = f.model.GetSymbolInfo(n).Symbol;
+          INamedTypeSymbol t = sym as INamedTypeSymbol ?? sym?.ContainingType;
+          while (t != null) {
+            if (declaredIn.TryGetValue(t.OriginalDefinition, out var other) && other != f) { set.Add(other); break; }
+            t = t.ContainingType;
+          }
+        }
+        deps[f] = set;
+      }
+      var result = new List<Source>();
+      var state = new Dictionary<Source, int>();
+      void Visit(Source f) {
+        if (state.TryGetValue(f, out int st) && st != 0) return;
+        state[f] = 1;
+        foreach (var d in deps[f].OrderBy(x => x.csFile, StringComparer.Ordinal)) Visit(d);
+        result.Add(f);
+        state[f] = 2;
+      }
+      foreach (var f in list.OrderBy(x => x.csFile, StringComparer.Ordinal)) Visit(f);
+      return result;
+    }
+
+    void AddFolderSorted(string folder)
+    {
+      foreach (var file in Directory.GetFiles(folder).OrderBy(x => x, StringComparer.Ordinal)) {
+        if (file.EndsWith(".cs") && !file.Contains("NETCoreApp")) AddFile(file);
+      }
+      foreach (var sub in Directory.GetDirectories(folder).OrderBy(x => x, StringComparer.Ordinal)) {
+        AddFolderSorted(sub);
+      }
+    }
+
     void AddFolder(string folder)
     {
       string[] files = Directory.GetFiles(folder);
@@ -306,7 +737,7 @@ namespace CCSharpCompiler;
       node.clss = new List<Class>();
       ninja_cpp.Append("build obj/" + baseFile + ext_obj + " : cpp " + node.cppFile + "\r\n");
       ninja_target.Append(" obj/" + baseFile + ext_obj);
-      node.tree = CSharpSyntaxTree.ParseText(node.src);
+      node.tree = CSharpSyntaxTree.ParseText(node.src, CrustParse);
       compiler = compiler.AddSyntaxTrees(node.tree);
       files.Add(node);
     }
